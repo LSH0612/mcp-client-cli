@@ -1,129 +1,32 @@
 #!/usr/bin/env python3
 
 """
-API Server for MCP Client CLI that streams responses using SSE
+Simplified API Server for MCP Client CLI that directly executes the CLI in a subprocess
 """
 
 import asyncio
 import json
 import logging
 import sys
+import os
 import io
-import argparse
+import subprocess
+import tempfile
 from typing import Dict, Any, List, Optional, AsyncGenerator
-from contextlib import redirect_stdout, asynccontextmanager
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-# Import CLI functionality directly to avoid circular imports
-from mcp_client_cli.cli import handle_conversation, SqliteStore
-from mcp_client_cli.cli import HumanMessage  # Import HumanMessage class
-from mcp_client_cli.const import SQLITE_DB
-from mcp_client_cli.config import AppConfig
-from mcp_client_cli.output import OutputHandler
-
-# Configure logging
+# Configure basic logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("mcp-api-server")
-
-# Replace the entire StreamingOutputHandler class with this implementation
-
-class StreamingOutputHandler(OutputHandler):
-    def __init__(self, text_only=True):
-        super().__init__(text_only=text_only, only_last_message=False)
-        self.text_queue = asyncio.Queue()
-        self.is_done = False
-        self.buffer = ""  # Buffer for plain text responses
-        self._initial_message_sent = False
-    
-    def update(self, chunk: any):
-        """Capture output and put it on the queue."""
-        # Send an initial message to let the client know processing has started
-        if not self._initial_message_sent:
-            self.text_queue.put_nowait("event: start\ndata: Processing request\n\n")
-            self._initial_message_sent = True
-        
-        # Direct handling of chunk to extract text content
-        extracted_text = self._extract_text_from_chunk(chunk)
-        if extracted_text:
-            logger.info(f"Extracted text from chunk: {extracted_text[:50]}...")
-            self.text_queue.put_nowait(extracted_text)
-            self.buffer += extracted_text
-        
-        # Still call parent update for other processing
-        super().update(chunk)
-    
-    def _extract_text_from_chunk(self, chunk: any) -> str:
-        """Extract text content directly from various chunk formats."""
-        # Handle various chunk formats directly
-        if isinstance(chunk, tuple) and len(chunk) >= 2:
-            # Handle message chunks
-            if chunk[0] == "messages" and len(chunk[1]) > 0:
-                message = chunk[1][0]
-                if hasattr(message, "content"):
-                    if isinstance(message.content, str):
-                        return message.content
-                    elif isinstance(message.content, list):
-                        # Extract text from content list (multimodal format)
-                        text_parts = []
-                        for item in message.content:
-                            if isinstance(item, dict) and "text" in item:
-                                text_parts.append(item["text"])
-                        return "".join(text_parts)
-            
-            # Handle values chunks
-            elif chunk[0] == "values" and isinstance(chunk[1], dict):
-                if "messages" in chunk[1] and len(chunk[1]["messages"]) > 0:
-                    message = chunk[1]["messages"][-1]
-                    if hasattr(message, "content"):
-                        if isinstance(message.content, str):
-                            return message.content
-                        elif isinstance(message.content, list):
-                            # Extract text from content list (multimodal format)
-                            text_parts = []
-                            for item in message.content:
-                                if isinstance(item, dict) and "text" in item:
-                                    text_parts.append(item["text"])
-                            return "".join(text_parts)
-        
-        # For direct string chunks
-        elif isinstance(chunk, str):
-            return chunk
-        
-        return ""
-    
-    def update_error(self, error: Exception):
-        """Capture error and put it on the queue."""
-        error_msg = f"Error: {str(error)}"
-        self.text_queue.put_nowait(f"event: error\ndata: {error_msg}\n\n")
-        self.buffer += f"\nERROR: {error_msg}"  # Add to buffer for plain text
-        super().update_error(error)
-        self.is_done = True
-    
-    def confirm_tool_call(self, config: dict, chunk: any) -> bool:
-        """Auto-confirm tool calls in API mode."""
-        # For API server, we auto-confirm all tool calls
-        if self._is_tool_call_requested(chunk, config):
-            tool_info = json.dumps({"tool_call": True, "auto_confirmed": True})
-            self.text_queue.put_nowait(f"event: tool_call\ndata: {tool_info}\n\n")
-            self.buffer += f"\n[Tool call auto-confirmed]"  # Add to buffer for plain text
-            return True
-        return True
-    
-    def finish(self):
-        """Mark streaming as complete."""
-        if not self.is_done:  # Only send close event if not already done
-            self.text_queue.put_nowait(f"event: close\ndata: Stream closed\n\n")
-            self.buffer += "\n[Response complete]"  # Add to buffer for plain text
-            self.is_done = True
-        super().finish()
 
 # API Models
 class ChatRequest(BaseModel):
@@ -141,272 +44,478 @@ class ChatResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    # Load app configuration on startup
-    app.state.config = AppConfig.load()
+    # Import config here to avoid circular imports
+    from mcp_client_cli.config import AppConfig
+    try:
+        app.state.config = AppConfig.load()
+        logger.info("Configuration loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load configuration: {e}")
+        app.state.config = None
+    
     yield
-    # Clean up on shutdown
-    logger.info("Shutting down API server")
+    
+    logger.info("API server shutting down")
 
 # Initialize FastAPI app
 app = FastAPI(
     title="MCP Client API",
-    description="API Server for MCP Client CLI",
+    description="Simplified API Server for MCP Client CLI",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# Add CORS middleware with proper configuration
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-    expose_headers=["Content-Type", "Content-Length"],  # Expose these headers
-    max_age=86400,  # Cache preflight requests for 1 day
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Type", "Content-Length"],
 )
 
-async def stream_response(output_handler: StreamingOutputHandler) -> AsyncGenerator[str, None]:
-    """Generate SSE response from output handler."""
-    # Send initial message immediately to establish connection
-    yield "event: start\ndata: Connection established\n\n"
+async def run_cli_process(message: str, continue_conversation: bool = False,
+                         no_tools: bool = False, model: Optional[str] = None):
+    """Run the CLI in a subprocess and capture its output."""
+    # Prepare command arguments
+    cmd = [sys.executable, "-m", "mcp_client_cli.cli"]
     
-    while True:
-        try:
-            # Try to get a message from the queue with a short timeout
-            message = await asyncio.wait_for(output_handler.text_queue.get(), timeout=0.1)
-            
-            # Format and send the message
-            if message.startswith("event:"):
-                # Already formatted as SSE
-                yield message
-            else:
-                # Format as SSE message
-                yield f"data: {message}\n\n"
-                
-            # If we got the close event, exit the loop
-            if message.startswith("event: close"):
-                break
-                
-        except asyncio.TimeoutError:
-            # No message available - if handler is done and queue is empty, break
-            if output_handler.is_done and output_handler.text_queue.empty():
-                yield "event: close\ndata: Stream complete\n\n"
-                break
-                
-            # Otherwise, send a heartbeat and continue
-            yield ":heartbeat\n\n"
-            await asyncio.sleep(0.5)  # Send heartbeats every 0.5 seconds
-            
-        except Exception as e:
-            logger.exception(f"Error in stream_response: {str(e)}")
-            yield f"event: error\ndata: {str(e)}\n\n"
-            yield "event: close\ndata: Stream closed due to error\n\n"
-            break
-
-async def stream_text(output_handler: StreamingOutputHandler) -> AsyncGenerator[str, None]:
-    """Generate plain text stream response for curl."""
-    # Immediately send an empty line to establish connection
-    yield "\n"
+    # Add options
+    if no_tools:
+        cmd.append("--no-tools")
     
-    while True:
-        try:
-            # Try to get a message with a short timeout
-            message = await asyncio.wait_for(output_handler.text_queue.get(), timeout=0.1)
-            
-            # For plain text, filter out SSE formatting events and just yield content
-            if not message.startswith("event:"):
-                yield message
-                
-            # If we received close event, exit after sending any remaining content
-            if message.startswith("event: close"):
-                break
-                
-        except asyncio.TimeoutError:
-            # If done and no more messages, break
-            if output_handler.is_done and output_handler.text_queue.empty():
-                break
-                
-            # Send a small heartbeat to keep the connection alive
-            yield ""
-            await asyncio.sleep(0.5)
-            
-        except Exception as e:
-            logger.exception(f"Error in stream_text: {str(e)}")
-            yield f"\nError: {str(e)}\n"
-            break
-
-def prepare_query(message: str, continue_conversation: bool = False) -> tuple[HumanMessage, bool]:
-    """Prepare query for the CLI handler without using parse_query."""
-    is_continuation = continue_conversation
+    if model:
+        cmd.extend(["--model", model])
     
+    # Add the message
     if continue_conversation:
-        query_text = f"c {message}"
+        cmd.extend(["c", message])
     else:
-        query_text = message
+        cmd.append(message)
     
-    # Create a HumanMessage directly without going through parse_query
-    return HumanMessage(content=query_text), is_continuation
-
-async def handle_chat(
-    request_message: str,
-    continue_conversation: bool = False,
-    no_tools: bool = False,
-    model: Optional[str] = None,
-    app_config: AppConfig = None
-) -> StreamingOutputHandler:
-    """Handle a chat request."""
-    # Create custom args similar to CLI
-    args = argparse.Namespace()
-    args.no_tools = no_tools
-    args.model = model
-    args.force_refresh = False
-    args.no_confirmations = True  # Auto-confirm tools in API mode
-    args.text_only = True
-    args.no_intermediates = False
-    args.list_tools = False
-    args.list_prompts = False
-    args.show_memories = False
+    # Create a queue for output
+    queue = asyncio.Queue()
     
-    # Prepare the query directly without using parse_query
-    query, is_conversation_continuation = prepare_query(
-        request_message, continue_conversation
-    )
-    
-    # Create a custom output handler for streaming
-    output_handler = StreamingOutputHandler(text_only=True)
-    
-    # Replace the output handler in conversation handling
-    from mcp_client_cli import output
-    original_handler = output.OutputHandler
-    output.OutputHandler = lambda *args, **kwargs: output_handler
-    
-    # Start a separate task to handle the conversation
-    conversation_task = asyncio.create_task(
-        handle_conversation(args, query, is_conversation_continuation, app_config)
-    )
-    
-    # Return the output handler immediately so we can start streaming responses
-    # The conversation will continue in the background
-    return output_handler, conversation_task
-
-@app.post("/api/chat", response_model=None)
-async def chat_post(
-    request: ChatRequest,
-    app_config: AppConfig = Depends(lambda: app.state.config)
-):
-    """Chat with the LLM - POST endpoint."""
-    logger.info(f"POST /api/chat - message: '{request.message[:50]}...' (stream: {request.stream})")
-    
-    if request.stream:
-        # Create a background task for the conversation
-        output_handler, conversation_task = await handle_chat(
-            request.message, 
-            request.continue_conversation, 
-            request.no_tools, 
-            request.model, 
-            app_config
-        )
-        
-        # Set up streaming response with background task cleanup
-        async def event_generator():
-            try:
-                async for chunk in stream_response(output_handler):
-                    yield chunk
-            except asyncio.CancelledError:
-                # If the client disconnects, cancel the conversation task
-                logger.info("Client disconnected, canceling conversation task")
-                conversation_task.cancel()
-                raise
-            except Exception as e:
-                logger.exception(f"Error in event generator: {str(e)}")
-                yield f"event: error\ndata: {str(e)}\n\n"
-                yield f"event: close\ndata: Stream closed due to error\n\n"
-            finally:
-                # Make sure we mark the output handler as done when the stream ends
-                if not output_handler.is_done:
-                    output_handler.finish()
-        
-        # Configure EventSourceResponse with the right parameters
-        return EventSourceResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # Prevents Nginx from buffering the response
-            }
-        )
-    else:
-        # For non-streaming, collect the full response
+    # Function to process output
+    async def process_output(stream, event_type):
         try:
-            output_handler, conversation_task = await handle_chat(
-                request.message, request.continue_conversation,
-                request.no_tools, request.model, app_config
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                
+                # Decode the line
+                try:
+                    text = line.decode('utf-8').strip()
+                    if text:
+                        # Skip initial connection/loading messages
+                        if "INFO" in text and ("Starting" in text or "Loading" in text):
+                            continue
+                            
+                        # Log the output for debugging
+                        logger.info(f"CLI {event_type}: {text[:100]}")
+                        
+                        # Send to client
+                        await queue.put({"event": "message", "data": text})
+                except Exception as e:
+                    logger.error(f"Error processing output: {e}")
+        except Exception as e:
+            logger.exception(f"Error in output processing: {e}")
+    
+    # Send initial message
+    await queue.put({"event": "start", "data": "Processing request..."})
+    
+    try:
+        # Start the process
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Process stdout and stderr concurrently
+        stdout_task = asyncio.create_task(process_output(process.stdout, "stdout"))
+        stderr_task = asyncio.create_task(process_output(process.stderr, "stderr"))
+        
+        # Wait for process to complete
+        exit_code = await process.wait()
+        
+        # Wait for output processing to complete
+        await stdout_task
+        await stderr_task
+        
+        # Send close event
+        await queue.put({"event": "close", "data": f"CLI process completed with exit code {exit_code}"})
+    except Exception as e:
+        logger.exception(f"Error running CLI process: {e}")
+        await queue.put({"event": "error", "data": str(e)})
+        await queue.put({"event": "close", "data": "Error running CLI process"})
+    
+    return queue
+
+# Alternative approach: Write to a temporary file and read from it
+async def run_with_temp_file(message: str, continue_conversation: bool = False,
+                            no_tools: bool = False, model: Optional[str] = None):
+    """Run the CLI and capture output to a temporary file."""
+    # Create a temporary file for output
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp_file:
+        temp_path = temp_file.name
+    
+    # Prepare command arguments
+    cmd = [sys.executable, "-m", "mcp_client_cli.cli"]
+    
+    # Add options
+    if no_tools:
+        cmd.append("--no-tools")
+    
+    if model:
+        cmd.extend(["--model", model])
+    
+    # Add the message
+    if continue_conversation:
+        cmd.extend(["c", message])
+    else:
+        cmd.append(message)
+    
+    # Create a queue for output
+    queue = asyncio.Queue()
+    
+    # Send initial message
+    await queue.put({"event": "start", "data": "Processing request..."})
+    
+    try:
+        # Start the process with output to the temp file
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=open(temp_path, 'w'),
+            stderr=subprocess.STDOUT
+        )
+        
+        # Function to check for new output in the file
+        async def check_output():
+            last_size = 0
+            
+            while True:
+                # Check if process is still running
+                if process.returncode is not None:
+                    # Process has completed
+                    break
+                
+                # Check current file size
+                current_size = os.path.getsize(temp_path)
+                
+                if current_size > last_size:
+                    # File has grown, read the new content
+                    with open(temp_path, 'r') as f:
+                        f.seek(last_size)
+                        new_content = f.read()
+                        
+                        if new_content:
+                            logger.info(f"New content: {new_content[:100]}")
+                            await queue.put({"event": "message", "data": new_content})
+                    
+                    last_size = current_size
+                
+                # Sleep before checking again
+                await asyncio.sleep(0.1)
+        
+        # Start checking for output
+        output_task = asyncio.create_task(check_output())
+        
+        # Wait for process to complete
+        exit_code = await process.wait()
+        
+        # Wait for output checking to complete
+        await output_task
+        
+        # Read any remaining output
+        with open(temp_path, 'r') as f:
+            remaining = f.read()
+            if remaining:
+                await queue.put({"event": "message", "data": remaining})
+        
+        # Send close event
+        await queue.put({"event": "close", "data": f"CLI process completed with exit code {exit_code}"})
+    except Exception as e:
+        logger.exception(f"Error running CLI process: {e}")
+        await queue.put({"event": "error", "data": str(e)})
+        await queue.put({"event": "close", "data": "Error running CLI process"})
+    finally:
+        # Clean up temporary file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+    
+    return queue
+
+# Direct integration approach
+async def direct_integrate(message: str, continue_conversation: bool = False,
+                         no_tools: bool = False, model: Optional[str] = None):
+    """Directly integrate with the CLI module."""
+    # Import CLI modules
+    from mcp_client_cli.cli import handle_conversation, parse_query
+    from mcp_client_cli.output import OutputHandler
+    
+    # Create a queue for output
+    queue = asyncio.Queue()
+    
+    # Create a custom output handler
+    class ApiOutputHandler(OutputHandler):
+        def __init__(self, queue, text_only=True):
+            super().__init__(text_only=text_only, only_last_message=False)
+            self.output_queue = queue
+            self.buffer = ""
+        
+        def update(self, chunk):
+            # Call parent implementation first
+            super().update(chunk)
+            
+            # Extract text content
+            content = self._extract_text(chunk)
+            if content and content.strip():
+                logger.info(f"Extracted content: {content[:100]}")
+                self.buffer += content
+                asyncio.create_task(self.output_queue.put({"event": "message", "data": content}))
+        
+        def _extract_text(self, chunk):
+            text = ""
+            
+            # Handle different chunk types
+            if isinstance(chunk, tuple) and len(chunk) >= 2:
+                chunk_type, chunk_data = chunk
+                
+                # Handle messages
+                if chunk_type == "messages" and chunk_data:
+                    message = chunk_data[0]
+                    if hasattr(message, "content"):
+                        if isinstance(message.content, str):
+                            text = message.content
+                        elif isinstance(message.content, list):
+                            parts = []
+                            for item in message.content:
+                                if isinstance(item, dict) and "text" in item:
+                                    parts.append(item["text"])
+                            text = "".join(parts)
+                
+                # Handle values
+                elif chunk_type == "values" and isinstance(chunk_data, dict):
+                    if "messages" in chunk_data and chunk_data["messages"]:
+                        message = chunk_data["messages"][-1]
+                        if hasattr(message, "content"):
+                            if isinstance(message.content, str):
+                                text = message.content
+            
+            # Handle direct string chunks
+            elif isinstance(chunk, str):
+                text = chunk
+            
+            return text
+        
+        def update_error(self, error):
+            super().update_error(error)
+            
+            # Send error to client
+            error_text = f"Error: {str(error)}"
+            asyncio.create_task(self.output_queue.put({"event": "error", "data": error_text}))
+        
+        def confirm_tool_call(self, config, chunk):
+            # Auto-confirm for API
+            return True
+        
+        def finish(self):
+            super().finish()
+            
+            # Send close event
+            asyncio.create_task(self.output_queue.put({"event": "close", "data": "Conversation complete"}))
+    
+    # Send initial message
+    await queue.put({"event": "start", "data": "Processing request..."})
+    
+    try:
+        # Create args
+        import argparse
+        args = argparse.Namespace()
+        args.no_tools = no_tools
+        args.model = model
+        args.force_refresh = False
+        args.no_confirmations = True
+        args.text_only = True
+        args.no_intermediates = False
+        args.list_tools = False
+        args.list_prompts = False
+        args.show_memories = False
+        
+        # Set up query
+        if continue_conversation:
+            args.query = ["c", message]
+        else:
+            args.query = [message]
+        
+        # Parse query
+        query, is_conversation_continuation = parse_query(args)
+        
+        # Prepare output handler
+        output_handler = ApiOutputHandler(queue, text_only=True)
+        
+        # Custom redirect to capture output
+        class TeeOutput:
+            def __init__(self, original, queue):
+                self.original = original
+                self.queue = queue
+            
+            def write(self, text):
+                # Write to original
+                self.original.write(text)
+                
+                # Send to client if meaningful
+                if text and len(text.strip()) > 5:
+                    asyncio.create_task(self.queue.put({"event": "message", "data": text}))
+                
+                return len(text)
+            
+            def flush(self):
+                self.original.flush()
+        
+        # Set up output redirection
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = TeeOutput(original_stdout, queue)
+        sys.stderr = TeeOutput(original_stderr, queue)
+        
+        # Override OutputHandler
+        import mcp_client_cli.output
+        original_handler_class = mcp_client_cli.output.OutputHandler
+        mcp_client_cli.output.OutputHandler = lambda *args, **kwargs: output_handler
+        
+        try:
+            # Run the conversation
+            conversation_task = asyncio.create_task(
+                handle_conversation(args, query, is_conversation_continuation, None)
             )
             
             # Wait for conversation to complete
             await conversation_task
             
-            # Collect all text from the queue
-            full_response = ""
-            while not output_handler.is_done or not output_handler.text_queue.empty():
-                try:
-                    msg = await asyncio.wait_for(output_handler.text_queue.get(), timeout=0.1)
-                    if not msg.startswith("event:"):  # Skip SSE formatting
-                        full_response += msg
-                except asyncio.TimeoutError:
-                    if output_handler.is_done and output_handler.text_queue.empty():
-                        break
-                    await asyncio.sleep(0.01)
+            # Send close event
+            await queue.put({"event": "close", "data": "Conversation complete"})
+        finally:
+            # Restore original stdout/stderr
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
             
-            return {"response": full_response}
-        except Exception as e:
-            logger.exception("Error processing non-streaming request")
-            raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/chat", response_model=None)
-async def chat_get(
-    message: str,
-    continue_conversation: bool = False,
-    no_tools: bool = False,
-    model: Optional[str] = None,
-    stream: bool = True,
-    app_config: AppConfig = Depends(lambda: app.state.config)
-):
-    """Chat with the LLM - GET endpoint."""
-    logger.info(f"GET /api/chat - message: '{message[:50]}...' (stream: {stream})")
+            # Restore original OutputHandler
+            mcp_client_cli.output.OutputHandler = original_handler_class
+    except Exception as e:
+        logger.exception(f"Error in direct integration: {e}")
+        await queue.put({"event": "error", "data": str(e)})
+        await queue.put({"event": "close", "data": "Error in direct integration"})
     
-    if stream:
-        # Process the conversation
-        output_handler, conversation_task = await handle_chat(
-            message, 
-            continue_conversation, 
-            no_tools, 
-            model, 
-            app_config
+    return queue
+
+# Use with Web UI
+class WebAPIHandler:
+    """Handler for web API that returns direct responses."""
+    
+    def __init__(self):
+        pass
+    
+    async def handle_request(self, message, continue_conversation=False, no_tools=False, model=None):
+        """Handle a request and return the response."""
+        # Generate and run the CLI command
+        cmd = [sys.executable, "-m", "mcp_client_cli.cli"]
+        
+        if no_tools:
+            cmd.append("--no-tools")
+        
+        if model:
+            cmd.extend(["--model", model])
+        
+        # Set text-only flag for cleaner output
+        cmd.append("--text-only")
+        
+        # Add message
+        if continue_conversation:
+            cmd.extend(["c", message])
+        else:
+            cmd.append(message)
+        
+        try:
+            # Run process and capture output
+            logger.info(f"Running command: {' '.join(cmd)}")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            # Collect stdout
+            stdout_data = await process.stdout.read()
+            stderr_data = await process.stderr.read()
+            
+            # Wait for process to complete
+            await process.wait()
+            
+            # Decode output
+            stdout_text = stdout_data.decode('utf-8')
+            stderr_text = stderr_data.decode('utf-8')
+            
+            logger.info(f"CLI stdout: {stdout_text[:100]}")
+            logger.info(f"CLI stderr: {stderr_text[:100]}")
+            
+            # Return the output
+            return stdout_text or stderr_text
+        except Exception as e:
+            logger.exception(f"Error running CLI: {e}")
+            return f"Error: {str(e)}"
+
+async def stream_response(queue):
+    """Stream SSE events from a queue."""
+    while True:
+        try:
+            msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+            
+            event_type = msg.get('event', '')
+            event_data = msg.get('data', '')
+            
+            if event_type == 'heartbeat':
+                yield ":heartbeat\n\n"
+            else:
+                yield f"event: {event_type}\ndata: {event_data}\n\n"
+            
+            if event_type == 'close':
+                break
+        except asyncio.TimeoutError:
+            # Send heartbeat
+            yield ":heartbeat\n\n"
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.exception(f"Error in stream_response: {e}")
+            yield f"event: error\ndata: {str(e)}\n\n"
+            yield f"event: close\ndata: Stream closed due to error\n\n"
+            break
+
+@app.post("/api/chat")
+async def chat_post(request: ChatRequest):
+    """Chat with the LLM - POST endpoint."""
+    logger.info(f"POST /api/chat - message: '{request.message[:50]}...' (stream: {request.stream})")
+    
+    # Use direct web API handler
+    handler = WebAPIHandler()
+    
+    if request.stream:
+        # Run CLI process
+        queue = await run_cli_process(
+            request.message,
+            request.continue_conversation,
+            request.no_tools,
+            request.model
         )
         
-        # Set up streaming response with background task cleanup
-        async def event_generator():
-            try:
-                async for chunk in stream_response(output_handler):
-                    yield chunk
-            except asyncio.CancelledError:
-                # If the client disconnects, cancel the conversation task
-                conversation_task.cancel()
-                raise
-            except Exception as e:
-                logger.exception("Error in event generator")
-                yield f"event: error\ndata: {str(e)}\n\n"
-                yield f"event: close\ndata: Stream closed due to error\n\n"
-            finally:
-                # Make sure we mark the output handler as done when the stream ends
-                if not output_handler.is_done:
-                    output_handler.finish()
-        
+        # Stream the response
         return EventSourceResponse(
-            event_generator(),
+            stream_response(queue),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -415,74 +524,100 @@ async def chat_get(
             }
         )
     else:
-        # For non-streaming, collect the full response
-        try:
-            output_handler, conversation_task = await handle_chat(
-                message, continue_conversation, no_tools, model, app_config
-            )
-            
-            # Wait for conversation to complete
-            await conversation_task
-            
-            # Collect all text from the queue
-            full_response = ""
-            while not output_handler.is_done or not output_handler.text_queue.empty():
-                try:
-                    msg = await asyncio.wait_for(output_handler.text_queue.get(), timeout=0.1)
-                    if not msg.startswith("event:"):  # Skip SSE formatting
-                        full_response += msg
-                except asyncio.TimeoutError:
-                    if output_handler.is_done and output_handler.text_queue.empty():
-                        break
-                    await asyncio.sleep(0.01)
-            
-            return {"response": full_response}
-        except Exception as e:
-            logger.exception("Error processing non-streaming request")
-            raise HTTPException(status_code=500, detail=str(e))
+        # For non-streaming, get the complete response directly
+        response = await handler.handle_request(
+            request.message,
+            request.continue_conversation,
+            request.no_tools,
+            request.model
+        )
+        
+        return {"response": response}
 
-# Add a curl-friendly text endpoint
-@app.get("/api/text", response_model=None)
-async def text_chat(
+@app.get("/api/chat")
+async def chat_get(
     message: str,
     continue_conversation: bool = False,
     no_tools: bool = False,
     model: Optional[str] = None,
-    app_config: AppConfig = Depends(lambda: app.state.config)
+    stream: bool = True
 ):
-    """
-    Chat with the LLM and return a plaintext response (curl-friendly).
-    """
-    logger.info(f"Processing text request: '{message}' (continuation: {continue_conversation})")
+    """Chat with the LLM - GET endpoint."""
+    logger.info(f"GET /api/chat - message: '{message[:50]}...' (stream: {stream})")
     
-    # Process the conversation
-    output_handler, conversation_task = await handle_chat(
-        message, 
-        continue_conversation, 
-        no_tools, 
-        model, 
-        app_config
+    # Use direct web API handler
+    handler = WebAPIHandler()
+    
+    if stream:
+        # Run CLI process
+        queue = await run_cli_process(
+            message,
+            continue_conversation,
+            no_tools,
+            model
+        )
+        
+        # Stream the response
+        return EventSourceResponse(
+            stream_response(queue),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+    else:
+        # For non-streaming, get the complete response directly
+        response = await handler.handle_request(
+            message,
+            continue_conversation,
+            no_tools,
+            model
+        )
+        
+        return {"response": response}
+
+@app.get("/api/text")
+async def text_chat(
+    message: str,
+    continue_conversation: bool = False,
+    no_tools: bool = False,
+    model: Optional[str] = None
+):
+    """Chat with the LLM and return a plaintext streaming response."""
+    logger.info(f"GET /api/text - message: '{message[:50]}...'")
+    
+    # Run CLI process
+    queue = await run_cli_process(
+        message,
+        continue_conversation,
+        no_tools,
+        model
     )
     
-    # Set up chunked streaming text response with background task cleanup
-    async def text_generator_with_cleanup():
+    # Stream text
+    async def text_generator():
         try:
-            async for chunk in stream_text(output_handler):
-                yield chunk
-        except asyncio.CancelledError:
-            # If the client disconnects, cancel the conversation task
-            conversation_task.cancel()
-            raise
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    
+                    if msg.get("event") == "message":
+                        yield msg.get("data", "")
+                    
+                    if msg.get("event") == "close":
+                        break
+                except asyncio.TimeoutError:
+                    # Keep connection alive
+                    yield ""
+                    await asyncio.sleep(0.5)
         except Exception as e:
-            logger.exception("Error in text generator")
+            logger.exception(f"Error in text generator: {e}")
             yield f"\nError: {str(e)}\n"
-        finally:
-            # Make sure we mark the output handler as done when the stream ends
-            if not output_handler.is_done:
-                output_handler.finish()
     
     return StreamingResponse(
-        text_generator_with_cleanup(),
+        text_generator(),
         media_type="text/plain",
         headers={
             "Cache-Control": "no-cache",
@@ -490,144 +625,74 @@ async def text_chat(
         }
     )
 
-# Add a simple plaintext endpoint that returns non-streaming response
 @app.get("/api/plaintext")
 async def plaintext_chat(
     message: str,
     continue_conversation: bool = False,
     no_tools: bool = False,
-    model: Optional[str] = None,
-    app_config: AppConfig = Depends(lambda: app.state.config)
+    model: Optional[str] = None
 ):
-    """
-    Chat with the LLM and return a simple plaintext response (not streaming).
-    """
-    try:
-        # Process the conversation
-        output_handler, conversation_task = await handle_chat(
-            message, continue_conversation, no_tools, model, app_config
-        )
-        
-        # Wait for the conversation task to complete
-        await conversation_task
-        
-        # Ensure all messages are processed
-        while not output_handler.text_queue.empty():
-            await asyncio.sleep(0.01)
-        
-        # Finish the handler if not already done
-        if not output_handler.is_done:
-            output_handler.finish()
-        
-        # Return the complete buffer content
-        return StreamingResponse(
-            content=iter([output_handler.buffer]),
-            media_type="text/plain"
-        )
-    except Exception as e:
-        logger.exception("Error processing plaintext request")
-        return StreamingResponse(
-            content=iter([f"Error: {str(e)}"]),
-            media_type="text/plain",
-            status_code=500
-        )
-
-@app.post("/api/json-chat")
-async def json_chat(
-    request: ChatRequest,
-    app_config: AppConfig = Depends(lambda: app.state.config)
-):
-    """Chat with the LLM with JSON response format."""
-    logger.info(f"POST /api/json-chat - message: '{request.message[:50]}...'")
+    """Chat with the LLM and return a non-streaming plaintext response."""
+    logger.info(f"GET /api/plaintext - message: '{message[:50]}...'")
     
-    # Process the conversation
-    output_handler, conversation_task = await handle_chat(
-        request.message, 
-        request.continue_conversation, 
-        request.no_tools, 
-        request.model, 
-        app_config
+    # Use direct web API handler for simplicity
+    handler = WebAPIHandler()
+    response = await handler.handle_request(
+        message,
+        continue_conversation,
+        no_tools,
+        model
     )
     
-    # For JSON streaming, we'll collect all chunks and construct a proper response
-    if request.stream:
-        async def json_stream():
-            try:
-                # Initiate the stream with an opening event
-                yield json.dumps({"event": "start", "data": "Connection established"}) + "\n"
-                
-                while True:
-                    try:
-                        # Get a message with short timeout
-                        message = await asyncio.wait_for(output_handler.text_queue.get(), timeout=0.1)
-                        
-                        # Skip events other than normal text
-                        if message.startswith("event:"):
-                            if "close" in message:
-                                # Send final message and exit
-                                yield json.dumps({"event": "close", "data": "Stream complete"}) + "\n"
-                                break
-                            continue
-                            
-                        # Send the actual content
-                        yield json.dumps({"event": "message", "data": message}) + "\n"
-                        
-                    except asyncio.TimeoutError:
-                        # If handler is done and queue is empty, end the stream
-                        if output_handler.is_done and output_handler.text_queue.empty():
-                            yield json.dumps({"event": "close", "data": "Stream complete"}) + "\n"
-                            break
-                            
-                        # Otherwise, send a heartbeat
-                        yield json.dumps({"event": "heartbeat"}) + "\n"
-                        await asyncio.sleep(0.5)
-                        
-            except Exception as e:
-                logger.exception(f"Error in JSON stream: {str(e)}")
-                yield json.dumps({"event": "error", "data": str(e)}) + "\n"
-                
-            finally:
-                # Make sure conversation task is handled properly
-                if not output_handler.is_done:
-                    output_handler.finish()
-                    
-        return StreamingResponse(
-            json_stream(),
-            media_type="application/x-ndjson",  # Use newline-delimited JSON format
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
-            }
-        )
-    else:
-        # Wait for conversation to complete
-        await conversation_task
-        
-        # Collect all text from the queue
-        full_response = ""
-        while not output_handler.is_done or not output_handler.text_queue.empty():
-            try:
-                msg = await asyncio.wait_for(output_handler.text_queue.get(), timeout=0.1)
-                if not msg.startswith("event:"):  # Skip SSE formatting
-                    full_response += msg
-            except asyncio.TimeoutError:
-                if output_handler.is_done and output_handler.text_queue.empty():
-                    break
-                await asyncio.sleep(0.01)
-        
-        return {"response": full_response}
+    return StreamingResponse(
+        content=iter([response]),
+        media_type="text/plain"
+    )
 
 @app.get("/api/health")
-async def health():
+async def health_check():
     """Health check endpoint."""
-    return {"status": "ok"}
+    return {"status": "ok", "version": "1.0.0"}
+
+@app.get("/api/direct")
+async def direct_response(
+    message: str,
+    continue_conversation: bool = False
+):
+    """Get a direct response without streaming."""
+    # Create a command line for the llm tool
+    cmd = [sys.executable, "-m", "mcp_client_cli.cli"]
+    
+    # Add text-only for cleaner output
+    cmd.append("--text-only")
+    
+    # Add message
+    if continue_conversation:
+        cmd.extend(["c", message])
+    else:
+        cmd.append(message)
+    
+    try:
+        # Run the command and capture output
+        process = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            check=False
+        )
+        
+        # Return the output
+        return {"response": process.stdout or process.stderr}
+    except Exception as e:
+        logger.exception(f"Error in direct response: {e}")
+        return {"error": str(e)}
 
 def main():
     """Start the API server."""
     import uvicorn
     
     logger.info("Starting MCP API Server on port 5000")
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=5000, log_level="info")
 
 if __name__ == "__main__":
     main()
